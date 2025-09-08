@@ -1,1 +1,549 @@
+# --- Standard library imports
+from datetime import date, timedelta
+from typing import Optional
+from pathlib import Path
+import optimization_app as eng
 
+# --- Third-party imports
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
+
+try:
+    import plotly.express as px  # optional; app will work without it
+except Exception:  # noqa: E722 - broad except is OK to keep optional
+    px = None
+
+
+def _discover_available_tickers() -> list[str]:
+    try:
+        files = eng.discover_etf_files()
+        # Use file stems (e.g., SPY.xlsx -> SPY)
+        return [Path(f).stem for f in files]
+    except Exception:
+        return ["SPY", "AGG", "GLD"]
+
+
+def render_sidebar() -> None:
+    """Render the left sidebar with inputs (expanded by default)."""
+    with st.sidebar:
+        st.header("Portfolio Builder")
+        with st.expander("Setup & Inputs", expanded=True):
+            # One-time defaults to prevent widget resets on first interaction
+            if "_ui_defaults_set" not in st.session_state:
+                st.session_state["_ui_defaults_set"] = True
+                st.session_state.setdefault("start_date", (date.today() - timedelta(days=365*5)))
+                st.session_state.setdefault("end_date", date.today())
+                _all = _discover_available_tickers()
+                if not _all:
+                    _all = ["SPY", "AGG", "GLD"]
+                st.session_state.setdefault("tickers", [])
+                st.session_state.setdefault("weight_bounds", {})
+                st.session_state.setdefault("W_RET", 6)
+                st.session_state.setdefault("W_VOL", 3)
+                # W_LOSS is derived later
+
+            st.markdown(
+                """
+                Configure your analysis window, assets, and preferences. We'll wire your
+                existing data/optimization scripts to these inputs as we go.
+                """
+            )
+
+            # --- Data window ---
+            today = date.today()
+            default_start = today - timedelta(days=365 * 5)
+            col_a, col_b = st.columns(2)
+            start_date = col_a.date_input("Start date", value=default_start, key="start_date")
+            end_date = col_b.date_input("End date", value=today, key="end_date")
+
+            # --- Tickers (multiselect) & per‑ticker weight ranges ---
+            all_tickers = _discover_available_tickers()
+
+            # Render the multiselect bound to a stable key; do NOT pass `default` each rerun
+            selected_tickers = st.multiselect(
+                "Assets",
+                options=all_tickers,
+                key="tickers",
+                help="Choose assets to include in the portfolio.",
+            )
+            # If user cleared everything, keep it empty; otherwise selections persist via key
+
+            # For each selected ticker, show a range slider for weight bounds (0–100%)
+            weight_bounds = {}
+            for t in selected_tickers:
+                prev_low, prev_high = st.session_state.get("weight_bounds", {}).get(t, (0, 100))
+                # Initialize once so we can omit `value=` and avoid resets
+                if f"wb_{t}" not in st.session_state:
+                    st.session_state[f"wb_{t}"] = (int(prev_low), int(prev_high))
+                # Render slider without `value=`; Streamlit will use the keyed state
+                low, high = st.slider(
+                    f"{t} weight range (%)",
+                    min_value=0,
+                    max_value=100,
+                    step=1,
+                    help="Lower and upper bounds for this asset's portfolio weight.",
+                    key=f"wb_{t}",
+                )
+                if low > high:
+                    low, high = high, low
+                    st.session_state[f"wb_{t}"] = (low, high)
+                weight_bounds[t] = (low, high)
+            # Persist current bounds in session state for next rerender
+            st.session_state["weight_bounds"] = weight_bounds
+
+            # --- Risk preferences ---
+            st.subheader("Risk preferences")
+            st.caption("Weights must sum to 10. Adjust Return and Fluctuations; Loss aversion is set automatically so the total is exactly 10.")
+
+            w_ret = st.slider(
+                "Return",
+                min_value=0,
+                max_value=10,
+                step=1,
+                key="W_RET",
+                help="Weight placed on expected return (higher favors return).",
+            )
+            max_vol = 10 - st.session_state.get("W_RET", 6)
+            if st.session_state.get("W_VOL", 3) > max_vol:
+                st.session_state["W_VOL"] = max_vol
+            w_vol = st.slider(
+                "Fluctuations",
+                min_value=0,
+                max_value=max_vol,
+                step=1,
+                key="W_VOL",
+                help="Weight placed on volatility (higher penalizes volatility).",
+            )
+            w_loss = 10 - st.session_state.get("W_RET", 0) - st.session_state.get("W_VOL", 0)
+            st.session_state["W_LOSS"] = w_loss
+            st.slider(
+                "Loss aversion",
+                min_value=0,
+                max_value=10,
+                step=1,
+                value=w_loss,
+                disabled=True,
+                help="Weight placed on downside/loss (higher penalizes drawdowns).",
+            )
+
+            # Persist inputs in session state for use in main area
+            st.session_state["inputs"] = {
+                "start_date": st.session_state["start_date"],
+                "end_date": st.session_state["end_date"],
+                "tickers": st.session_state.get("tickers", []),
+                "weight_bounds": st.session_state.get("weight_bounds", {}),
+                "frequency": "monthly",
+                "W_RET": st.session_state.get("W_RET", 0),
+                "W_VOL": st.session_state.get("W_VOL", 0),
+                "W_LOSS": st.session_state.get("W_LOSS", 0),
+            }
+
+
+# ---- Integration layer: call user's engines if available, else mock ----
+
+
+
+def _mock_fetch_prices(tickers, start_date, end_date, frequency):
+    """Generate a small random price panel for demo purposes."""
+    rng = pd.date_range(start=start_date, end=end_date, freq={"daily": "B", "weekly": "W-FRI", "monthly": "M"}[frequency])
+    np.random.seed(42)
+    prices = {}
+    for t in tickers:
+        # Geometric Brownian motion-ish synthetic path
+        steps = np.random.normal(loc=0.0005, scale=0.01, size=len(rng))
+        series = 100 * (1 + steps).cumprod()
+        prices[t] = pd.Series(series, index=rng)
+    return pd.DataFrame(prices)
+
+
+def _mock_optimize_portfolio(returns_df, W_RET, W_VOL, W_LOSS):
+    """Very simple mean-variance style weights with a drawdown-ish penalty."""
+    mu = returns_df.mean()
+    sigma = returns_df.std().replace(0, np.nan)
+    # Penalize assets with higher volatility and approximate downside via negative returns share
+    downside = (returns_df.clip(upper=0) ** 2).mean().replace(0, np.nan)
+    score = (W_RET + 1e-9) * mu - W_VOL * sigma - W_LOSS * downside
+    score = score.fillna(score.min())
+    raw_w = np.maximum(score, 0)
+    if raw_w.sum() == 0:
+        raw_w = np.ones_like(raw_w)
+    weights = raw_w / raw_w.sum()
+    return weights
+
+
+def run_portfolio_engine(tickers, start_date, end_date, frequency, W_RET, W_VOL, W_LOSS):
+    """Use optimization_app backend to load data, pick best lookback, and get weights."""
+    # Map symbols to filenames discovered by the backend
+    discovered = eng.discover_etf_files()
+    stem_to_file = {Path(f).stem: f for f in discovered}
+    files = [stem_to_file[t] for t in tickers if t in stem_to_file]
+    if not files:
+        raise RuntimeError("No matching ETF files found for the selected assets.")
+
+    # Load prices (panel) and clip to end_date if provided
+    px = eng.load_prices(files)
+    if end_date:
+        px = px.loc[:pd.to_datetime(end_date)]
+    px = px.ffill()
+
+    # Build bounds from UI (percent -> fraction)
+    ui_bounds = st.session_state.get("inputs", {}).get("weight_bounds", {})
+    bounds_by_ticker = {k: (v[0] / 100.0, v[1] / 100.0) for k, v in ui_bounds.items() if k in tickers}
+
+    # Choose best lookback using the backend's list
+    lookbacks = getattr(eng, "LOOKBACK_MONTHS_LIST", [6, 9, 12, 18, 24])
+
+    # Use the user's chosen start date for BACKTEST_START semantics
+    start_dt = pd.to_datetime(start_date)
+
+    # Optimize using best lookback
+    weights_series, stats, summary_df = eng.optimize_as_of_with_best_lookback(
+    px=px,
+    start_dt=start_dt,
+    lookbacks=lookbacks,
+    as_of_date=end_date,  # uses sidebar end date (defaults to today)
+    W_RET=W_RET,
+    W_VOL=W_VOL,
+    W_LOSS=W_LOSS,
+    bounds_by_ticker=bounds_by_ticker,
+)
+
+    # Earliest data required per lookback given the user start date
+    first_needed_by_lb = {}
+    for lb in lookbacks:
+        lb_start_needed = pd.to_datetime(start_date) - pd.DateOffset(months=int(lb)) + pd.Timedelta(days=1)
+        first_needed_by_lb[int(lb)] = lb_start_needed.date().isoformat()
+
+    # --- Build accumulated returns (since Start date) using constant final weights ---
+    rets_all = px.pct_change().dropna(how="any")
+    start_idx = pd.to_datetime(start_date)
+    end_idx = pd.to_datetime(end_date) if end_date else rets_all.index.max()
+    rets_slice = rets_all.loc[start_idx:end_idx]
+
+    # Ensure weights align to available columns within the slice
+    weights_aligned = weights_series.reindex(rets_slice.columns).fillna(0.0)
+    port_ret = (rets_slice[weights_aligned.index] * weights_aligned.values).sum(axis=1)
+    equity_port = (1.0 + port_ret).cumprod()
+
+    # Build SPY benchmark from available data over the same slice
+    spy_col = "SPY"
+    equity_spy = None
+    if spy_col in px.columns:
+        spy_px = px[spy_col].loc[rets_slice.index.min():rets_slice.index.max()]
+        equity_spy = (1.0 + spy_px.pct_change().dropna()).cumprod()
+    else:
+        # Try to load SPY from discovered files if not already included
+        if spy_col in stem_to_file:
+            spy_px_panel = eng.load_prices([stem_to_file[spy_col]])
+            if spy_col in spy_px_panel.columns:
+                spy_px = spy_px_panel[spy_col].loc[rets_slice.index.min():rets_slice.index.max()]
+                equity_spy = (1.0 + spy_px.pct_change().dropna()).cumprod()
+
+    # Assemble equity DataFrame directly over the sliced range (already starts at 1.0)
+    eq_df = pd.DataFrame({"Portfolio": equity_port})
+    if equity_spy is not None and len(equity_spy) > 0:
+        eq_df["SPY"] = equity_spy
+    # Drop rows with all-NA (in case SPY missing at edges)
+    eq_df = eq_df.dropna(how="all")
+
+    # Build diagnostics for Console tab
+    px_start = px.index.min().date().isoformat() if len(px.index) else None
+    px_end = px.index.max().date().isoformat() if len(px.index) else None
+
+    # Derive the optimization window used for final weights from stats
+    best_lb = stats.get("best_lookback")
+    as_of = pd.to_datetime(stats.get("as_of_date")) if stats.get("as_of_date") else None
+    lb_start_iso = lb_end_iso = None
+    if as_of is not None and best_lb is not None:
+        lb_end = as_of
+        lb_start = lb_end - pd.DateOffset(months=int(best_lb)) + pd.Timedelta(days=1)
+        lb_start_iso = lb_start.date().isoformat()
+        lb_end_iso = lb_end.date().isoformat()
+
+    debug = {
+        "selected_tickers": tickers,
+        "mapped_files": files,
+        "data_index_start": px_start,
+        "data_index_end": px_end,
+        "user_start_date": pd.to_datetime(start_date).date().isoformat() if start_date else None,
+        "user_end_date": pd.to_datetime(end_date).date().isoformat() if end_date else None,
+        "lookbacks_considered": lookbacks,
+        "best_lookback": best_lb,
+        "as_of_date": stats.get("as_of_date"),
+        "final_window_start": lb_start_iso,
+        "final_window_end": lb_end_iso,
+        "bounds_by_ticker": bounds_by_ticker,
+        "W_RET": W_RET,
+        "W_VOL": W_VOL,
+        "W_LOSS": W_LOSS,
+        "first_needed_by_lookback": first_needed_by_lb,
+    }
+
+    return {
+        "weights": weights_series,
+        "stats": stats | {"n_assets": len(tickers)},
+        "summary": summary_df,
+        "debug": debug,
+        "used_mock_data": False,
+        "used_mock_engine": False,
+        "equity": eq_df,
+    }
+
+
+def render_results(result_dict):
+    """Render results: weights table, stats, and simple charts."""
+    weights = result_dict["weights"].rename("weight").to_frame()
+    weights.index.name = "Asset"
+    stats = result_dict.get("stats", {})
+    as_of = stats.get("as_of_date")
+    if as_of:
+        st.caption(f"Weights as of: {as_of}")
+
+    st.subheader("Proposed asset weights")
+    st.dataframe(weights.style.format({"weight": "{:.2%}"}))
+
+    st.subheader("Summary")
+    cols = st.columns(2)
+    best_lb = stats.get("best_lookback")
+    cols[0].metric("Best lookback (months)", f"{best_lb}" if best_lb is not None else "—")
+    cols[1].metric("# Assets", f"{stats.get('n_assets', len(weights))}")
+
+    # --- Chart 1: Weights vs Bounds ---
+    st.markdown("### Weights vs. bounds")
+    dbg = result_dict.get("debug", {})
+    bounds_dict = dbg.get("bounds_by_ticker", {}) or {}
+
+    weights_df = weights.reset_index().rename(columns={"index": "Asset", "weight": "Weight"})
+    # Build bounds dataframe; default to 0-100 if not present
+    bounds_rows = []
+    for asset in weights_df["Asset"].tolist():
+        low, high = bounds_dict.get(asset, (0.0, 1.0))
+        bounds_rows.append({"Asset": asset, "Lower": low * 100.0, "Upper": high * 100.0})
+    bounds_df = pd.DataFrame(bounds_rows)
+
+    merged = weights_df.merge(bounds_df, on="Asset", how="left")
+    merged["WeightPct"] = merged["Weight"] * 100.0
+
+    rule = alt.Chart(merged).mark_rule().encode(
+        x=alt.X("Asset:N", sort=merged["Asset"].tolist()),
+        y=alt.Y("Lower:Q", title="Weight (%)"),
+        y2="Upper:Q",
+        tooltip=["Asset", alt.Tooltip("Lower:Q", format=".1f"), alt.Tooltip("Upper:Q", format=".1f")],
+    )
+    point = alt.Chart(merged).mark_point(size=90).encode(
+        x="Asset:N",
+        y=alt.Y("WeightPct:Q", title="Weight (%)"),
+        tooltip=["Asset", alt.Tooltip("WeightPct:Q", title="Weight", format=".2f")],
+    )
+    st.altair_chart((rule + point).interactive(), use_container_width=True)
+
+    # --- Chart 2: Lookback performance ---
+    st.markdown("### Lookback performance (avg/sd ratio)")
+    summary = result_dict.get("summary")
+    if isinstance(summary, pd.DataFrame) and not summary.empty and "lookback_months" in summary.columns:
+        best_lb = stats.get("best_lookback")
+        perf = summary.copy()
+        perf = perf.sort_values("lookback_months")
+        perf["is_best"] = perf["lookback_months"].astype(int) == int(best_lb) if best_lb is not None else False
+
+        line = alt.Chart(perf).mark_line().encode(
+            x=alt.X("lookback_months:Q", title="Lookback (months)"),
+            y=alt.Y("return_sd_ratio:Q", title="Avg excess / SD"),
+        )
+        pts = alt.Chart(perf).mark_point(filled=True).encode(
+            x="lookback_months:Q",
+            y="return_sd_ratio:Q",
+            size=alt.condition("datum.is_best", alt.value(150), alt.value(60)),
+            color=alt.condition("datum.is_best", alt.value("black"), alt.value("steelblue")),
+            tooltip=[
+                alt.Tooltip("lookback_months:Q", title="Lookback (m)"),
+                alt.Tooltip("return_sd_ratio:Q", title="Avg/SD", format=".3f"),
+                alt.Tooltip("avg_monthly_excess:Q", title="Avg excess", format=".4f"),
+                alt.Tooltip("sd_monthly_excess:Q", title="SD", format=".4f"),
+                alt.Tooltip("n_periods:Q", title="# months"),
+                alt.Tooltip("first_rebalance:N", title="First rebalance"),
+                alt.Tooltip("last_rebalance:N", title="Last rebalance"),
+            ],
+        )
+        st.altair_chart((line + pts).interactive(), use_container_width=True)
+    else:
+        st.caption("Lookback summary not available for chart.")
+
+    # --- Chart 3: Accumulated returns since Start date ---
+    st.markdown("### Accumulated returns since start date")
+    eq_df = result_dict.get("equity")
+    if isinstance(eq_df, pd.DataFrame) and not eq_df.empty:
+        eq_long = eq_df.reset_index().melt(id_vars=[eq_df.index.name or "index"], var_name="Series", value_name="Value")
+        # Ensure we have a proper date column name for Altair
+        if eq_df.index.name is None:
+            eq_long = eq_long.rename(columns={"index": "Date"})
+            x_enc = alt.X("Date:T", title="Date")
+        else:
+            x_enc = alt.X(f"{eq_df.index.name}:T", title="Date")
+        line_eq = alt.Chart(eq_long).mark_line().encode(
+            x=x_enc,
+            y=alt.Y("Value:Q", title="Accumulated return (start=1.0)"),
+            color=alt.Color("Series:N", title="Series"),
+            tooltip=["Series:N", alt.Tooltip("Value:Q", format=".3f"), alt.Tooltip("Date:T", title="Date")],
+        )
+        st.altair_chart(line_eq.interactive(), use_container_width=True)
+    else:
+        st.caption("Accumulated returns not available.")
+
+    with st.expander("Lookback sweep details", expanded=False):
+        summary = result_dict.get("summary")
+        if isinstance(summary, pd.DataFrame) and not summary.empty:
+            st.dataframe(summary)
+        else:
+            st.caption("No sweep results available.")
+
+
+def render_console(result_dict):
+    st.subheader("Computation console")
+    dbg = result_dict.get("debug", {})
+
+    # High-signal fields upfront
+    col1, col2, col3 = st.columns(3)
+    col1.metric("As of", dbg.get("as_of_date", "—"))
+    col2.metric("Best lookback", str(dbg.get("best_lookback", "—")))
+    col3.metric("# Assets", str(len(result_dict.get("weights", []))))
+
+    st.markdown("### Inputs & Mappings")
+    st.json({
+        "selected_tickers": dbg.get("selected_tickers"),
+        "mapped_files": dbg.get("mapped_files"),
+        "bounds_by_ticker": dbg.get("bounds_by_ticker"),
+        "W_RET": dbg.get("W_RET"),
+        "W_VOL": dbg.get("W_VOL"),
+        "W_LOSS": dbg.get("W_LOSS"),
+    })
+
+    st.markdown("### Dates & Windows")
+    st.json({
+        "user_start_date": dbg.get("user_start_date"),
+        "user_end_date": dbg.get("user_end_date"),
+        "data_index_start": dbg.get("data_index_start"),
+        "data_index_end": dbg.get("data_index_end"),
+        "lookbacks_considered": dbg.get("lookbacks_considered"),
+        "final_window_start": dbg.get("final_window_start"),
+        "final_window_end": dbg.get("final_window_end"),
+    })
+
+    st.markdown("### Window construction rule")
+    st.caption(
+        "For a given lookback **L** and a rebalance date **R**, the optimizer window is "
+        "[R − L months + 1 day, R − 1 day]. The sweep evaluates monthly excess returns "
+        "computed from those windows across all eligible months starting at your Start date."
+    )
+
+    st.markdown("### Earliest required date by lookback")
+    st.json(result_dict.get("debug", {}).get("first_needed_by_lookback", {}))
+
+    st.markdown("### Lookback sweep table")
+    summary = result_dict.get("summary")
+    if isinstance(summary, pd.DataFrame) and not summary.empty:
+        st.dataframe(summary)
+    else:
+        st.caption("No sweep results available.")
+
+    st.markdown("### Monthly weights (best lookback)")
+    mw = result_dict.get("stats", {}).get("monthly_weights")
+    if isinstance(mw, pd.DataFrame) and not mw.empty:
+        df_mw = mw.copy()
+        try:
+            df_mw.index = pd.to_datetime(df_mw.index)
+        except Exception:
+            pass
+        df_mw = df_mw.sort_index()
+        df_mw.index.name = "Rebalance date"
+        st.dataframe(df_mw.style.format("{:.2%}"))
+    else:
+        st.caption("No monthly weights available.")
+
+
+def main() -> None:
+    """Entry point for the Streamlit app."""
+    st.title("Portfolio Builder")
+    st.caption("Balance asset classes by risk/return and aversion to loss.")
+
+    # Sidebar UI
+    render_sidebar()
+
+    # Tabs for a simple flow
+    tab1, tab2, tab3, tab4 = st.tabs(["1) Review Inputs", "2) Build Portfolio", "3) Results", "4) Console"])
+
+    with tab1:
+        st.markdown("### Current inputs")
+        st.json(st.session_state.get("inputs", {}))
+        st.info(
+            """
+            **How this run will work**
+            
+            • **Assets** come from Excel files in `etf_downloads/` (symbol = file name).  
+            • **Risk preferences** (Return, Fluctuations, Loss aversion) must sum to 10.  
+            • **Per‑asset bounds** (0–100%) are enforced in both the lookback sweep **and** the final optimization.  
+            • **Best lookback** is chosen by the highest average excess / standard deviation since your Start date.  
+            • **Final weights** are optimized **as of the End date** (last trading day ≤ End date).  
+            
+            See the **Results** tab for weights and charts, and the **Console** tab for detailed diagnostics (dates, windows, and monthly weights).
+            """,
+            icon="ℹ️",
+        )
+
+    with tab2:
+        run = st.button("Run analysis", type="primary")
+        if run:
+            inputs = st.session_state["inputs"]
+            with st.status("Running analysis…", expanded=True) as status:
+                prog = st.progress(0)
+
+                status.update(label="Discovering files…")
+                prog.progress(10)
+
+                status.update(label="Loading price data…")
+                prog.progress(30)
+
+                status.update(label="Preparing inputs (bounds, weights)…")
+                prog.progress(45)
+
+                status.update(label="Sweeping lookbacks & optimizing weights…")
+                try:
+                    result = run_portfolio_engine(
+                        tickers=inputs["tickers"],
+                        start_date=inputs["start_date"],
+                        end_date=inputs["end_date"],
+                        frequency=inputs["frequency"],
+                        W_RET=inputs["W_RET"],
+                        W_VOL=inputs["W_VOL"],
+                        W_LOSS=inputs["W_LOSS"],
+                    )
+                    prog.progress(95)
+                except Exception as e:
+                    status.update(label="Analysis failed", state="error")
+                    st.error(f"Analysis failed: {e}")
+                else:
+                    status.update(label="Rendering results…")
+                    st.session_state["last_result"] = result
+                    prog.progress(100)
+                    status.update(label="Analysis complete", state="complete")
+                    st.success("Analysis complete. See the Results tab.")
+        else:
+            st.caption("Click **Run analysis** to build a portfolio with the current settings.")
+
+    with tab3:
+        if "last_result" in st.session_state:
+            render_results(st.session_state["last_result"])
+        else:
+            st.info("No results yet. Use the **Build Portfolio** tab to run an analysis.", icon="🧪")
+
+    with tab4:
+        if "last_result" in st.session_state:
+            render_console(st.session_state["last_result"])
+        else:
+            st.info("Run an analysis to view console diagnostics.")
+
+
+if __name__ == "__main__":
+    main()
